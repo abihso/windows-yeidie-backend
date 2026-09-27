@@ -130,6 +130,7 @@ export function readConfig(env = process.env) {
       .filter(Boolean),
     turnUrls,
     turnSecret: value.TURN_SECRET,
+    callInvitationTimeoutMs: 10 * 60 * 1000,
     maxCallParticipants: 6,
     enableDemo: value.ENABLE_DEMO,
   };

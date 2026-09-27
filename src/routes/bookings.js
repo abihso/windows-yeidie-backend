@@ -350,14 +350,26 @@ export function bookingRoutes({ pool, io }) {
       if (!booking) {
         throw new AppError(404, "BOOKING_NOT_FOUND", "Booking not found.");
       }
-      if (
-        status !== "cancelled" &&
-        (req.user.id !== counsellorId || req.user.role !== "counsellor")
-      ) {
+      const canManageBooking =
+        req.user.role === "admin" ||
+        (req.user.role === "counsellor" && req.user.id === counsellorId);
+      const canCancelBooking =
+        canManageBooking ||
+        (req.user.role === "client" && req.user.id === clientId);
+
+      if (status !== "cancelled" && !canManageBooking) {
         throw new AppError(
           403,
           "FORBIDDEN",
-          "Only the assigned counsellor can confirm or complete this booking.",
+          "Only the assigned counsellor, the client, or an admin can update this booking.",
+        );
+      }
+
+      if (status === "cancelled" && !canCancelBooking) {
+        throw new AppError(
+          403,
+          "FORBIDDEN",
+          "Only the client, counsellor, or admin can cancel this booking.",
         );
       }
       const validTransition =

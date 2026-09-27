@@ -105,6 +105,7 @@ test("following, direct/group conversations and persisted messages enforce membe
   const alice = await f.account("client", "Alice");
   const bob = await f.account("client", "Bob");
   const outsider = await f.account("client", "Outsider");
+  const newMember = await f.account("client", "New Member");
   await alice.request("post", `/api/users/${alice.id}/follow`).expect(400);
   await alice.request("post", `/api/users/${bob.id}/follow`).expect(200);
   await alice.request("post", `/api/users/${bob.id}/follow`).expect(200);
@@ -179,6 +180,51 @@ test("following, direct/group conversations and persisted messages enforce membe
     mine.body.conversations.map((c) => c.id),
     [group.body.conversation.id],
   );
+  const renamed = await alice
+    .request("patch", `/api/conversations/${group.body.conversation.id}`, {
+      title: "Renewed peer support",
+    })
+    .expect(200);
+  assert.equal(renamed.body.conversation.title, "Renewed peer support");
+  await bob
+    .request("patch", `/api/conversations/${group.body.conversation.id}`, {
+      title: "Not allowed",
+    })
+    .expect(403);
+  const added = await alice
+    .request(
+      "post",
+      `/api/conversations/${group.body.conversation.id}/members`,
+      {
+        memberId: newMember.id,
+      },
+    )
+    .expect(201);
+  assert.equal(added.body.members.length, 4);
+  await bob
+    .request(
+      "delete",
+      `/api/conversations/${group.body.conversation.id}/members/${alice.id}`,
+    )
+    .expect(403);
+  await alice
+    .request(
+      "delete",
+      `/api/conversations/${group.body.conversation.id}/members/${bob.id}`,
+    )
+    .expect(204);
+  await bob
+    .request(
+      "delete",
+      `/api/conversations/${group.body.conversation.id}/members/${bob.id}`,
+    )
+    .expect(404);
+  await alice
+    .request("delete", `/api/conversations/${group.body.conversation.id}`)
+    .expect(204);
+  await alice
+    .request("get", `/api/conversations/${group.body.conversation.id}/messages`)
+    .expect(404);
 });
 
 test("server startup repairs missing community tables before serving posts", async (t) => {

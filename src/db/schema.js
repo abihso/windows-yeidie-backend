@@ -34,7 +34,10 @@ export const users = pgTable(
   (table) => [
     uniqueIndex("users_email_unique").on(table.email),
     check("users_email_lowercase", sql`${table.email} = lower(${table.email})`),
-    check("users_role_check", sql`${table.role} in ('client', 'counsellor')`),
+    check(
+      "users_role_check",
+      sql`${table.role} in ('client', 'counsellor', 'admin')`,
+    ),
   ],
 );
 

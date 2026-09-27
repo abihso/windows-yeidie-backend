@@ -15,6 +15,13 @@
       "when": 1790080292028,
       "tag": "0001_cooing_squirrel_girl",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790503866305,
+      "tag": "0002_mixed_rocket_racer",
+      "breakpoints": true
     }
   ]
 }

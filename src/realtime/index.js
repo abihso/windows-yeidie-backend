@@ -172,7 +172,7 @@ export function attachRealtime(io, { pool, sessionMiddleware, config }) {
 
   const pendingCalls = new Map();
   const pendingByUser = new Map();
-  const invitationTimeoutMs = config.callInvitationTimeoutMs ?? 45_000;
+  const invitationTimeoutMs = config.callInvitationTimeoutMs ?? 10 * 60 * 1000;
 
   function userSockets(userId) {
     return [...(io.sockets.adapter.rooms.get(`user:${userId}`) || [])]
@@ -181,15 +181,17 @@ export function attachRealtime(io, { pool, sessionMiddleware, config }) {
   }
 
   function isInCall(userId) {
-    return userSockets(userId).some((socket) =>
-      socket.data.callId || socket.data.acceptedCallId,
+    return userSockets(userId).some(
+      (socket) => socket.data.callId || socket.data.acceptedCallId,
     );
   }
 
   function notifyInvitation(name, invitation, extra = {}) {
     const payload = { ...invitation, ...extra };
-    io.to([`user:${invitation.fromUserId}`, `user:${invitation.targetUserId}`])
-      .emit(name, payload);
+    io.to([
+      `user:${invitation.fromUserId}`,
+      `user:${invitation.targetUserId}`,
+    ]).emit(name, payload);
     return payload;
   }
 
@@ -198,7 +200,8 @@ export function attachRealtime(io, { pool, sessionMiddleware, config }) {
     clearTimeout(pending?.timer);
     pendingCalls.delete(invitation.requestId);
     for (const userId of [invitation.fromUserId, invitation.targetUserId]) {
-      if (pendingByUser.get(userId) === invitation.requestId) pendingByUser.delete(userId);
+      if (pendingByUser.get(userId) === invitation.requestId)
+        pendingByUser.delete(userId);
     }
   }
 
@@ -210,11 +213,19 @@ export function attachRealtime(io, { pool, sessionMiddleware, config }) {
   function pendingInvitation(requestId, userId, role) {
     const invitation = pendingCalls.get(requestId)?.invitation;
     if (!invitation || invitation[role] !== userId) {
-      throw new AppError(404, "CALL_REQUEST_NOT_FOUND", "This call request is no longer available.");
+      throw new AppError(
+        404,
+        "CALL_REQUEST_NOT_FOUND",
+        "This call request is no longer available.",
+      );
     }
     if (Date.parse(invitation.expiresAt) <= Date.now()) {
       finishInvitation("call:expired", invitation, "no_answer");
-      throw new AppError(409, "CALL_REQUEST_EXPIRED", "This call request has expired.");
+      throw new AppError(
+        409,
+        "CALL_REQUEST_EXPIRED",
+        "This call request has expired.",
+      );
     }
     return invitation;
   }
@@ -357,16 +368,41 @@ export function attachRealtime(io, { pool, sessionMiddleware, config }) {
     event("call:request", callRequestSchema, (input) =>
       withCallLock(async () => {
         const fromUserId = socket.data.userId;
-        const target = await assertDirectCallAccess(pool, input.conversationId, fromUserId, input.targetUserId);
-        if (!socket.connected) throw new AppError(409, "SOCKET_DISCONNECTED", "Reconnect before calling.");
+        const target = await assertDirectCallAccess(
+          pool,
+          input.conversationId,
+          fromUserId,
+          input.targetUserId,
+        );
+        if (!socket.connected)
+          throw new AppError(
+            409,
+            "SOCKET_DISCONNECTED",
+            "Reconnect before calling.",
+          );
         if (pendingByUser.has(fromUserId) || isInCall(fromUserId)) {
-          throw new AppError(409, "ALREADY_IN_CALL", "Finish your current call before starting another.");
+          throw new AppError(
+            409,
+            "ALREADY_IN_CALL",
+            "Finish your current call before starting another.",
+          );
         }
         if (!userSockets(input.targetUserId).length) {
-          throw new AppError(409, "USER_OFFLINE", "This person is currently offline.");
+          throw new AppError(
+            409,
+            "USER_OFFLINE",
+            "This person is currently offline.",
+          );
         }
-        if (pendingByUser.has(input.targetUserId) || isInCall(input.targetUserId)) {
-          throw new AppError(409, "USER_BUSY", "This person is already on another call.");
+        if (
+          pendingByUser.has(input.targetUserId) ||
+          isInCall(input.targetUserId)
+        ) {
+          throw new AppError(
+            409,
+            "USER_BUSY",
+            "This person is already on another call.",
+          );
         }
         const invitation = {
           requestId: randomUUID(),
@@ -379,7 +415,8 @@ export function attachRealtime(io, { pool, sessionMiddleware, config }) {
         };
         const timer = setTimeout(() => {
           void withCallLock(async () => {
-            if (pendingCalls.has(invitation.requestId)) finishInvitation("call:expired", invitation, "no_answer");
+            if (pendingCalls.has(invitation.requestId))
+              finishInvitation("call:expired", invitation, "no_answer");
           });
         }, invitationTimeoutMs);
         timer.unref?.();
@@ -393,15 +430,30 @@ export function attachRealtime(io, { pool, sessionMiddleware, config }) {
 
     event("call:accepted", callDecisionSchema, ({ requestId }) =>
       withCallLock(async () => {
-        const invitation = pendingInvitation(requestId, socket.data.userId, "targetUserId");
+        const invitation = pendingInvitation(
+          requestId,
+          socket.data.userId,
+          "targetUserId",
+        );
         const caller = io.sockets.sockets.get(invitation.callerSocketId);
         if (!socket.connected || !caller?.connected) {
           finishInvitation("call:cancelled", invitation, "disconnected");
-          throw new AppError(409, "CALLER_UNAVAILABLE", "The caller is no longer available.");
+          throw new AppError(
+            409,
+            "CALLER_UNAVAILABLE",
+            "The caller is no longer available.",
+          );
         }
-        if (isInCall(invitation.fromUserId) || isInCall(invitation.targetUserId)) {
+        if (
+          isInCall(invitation.fromUserId) ||
+          isInCall(invitation.targetUserId)
+        ) {
           finishInvitation("call:rejected", invitation, "busy");
-          throw new AppError(409, "USER_BUSY", "A participant is already on another call.");
+          throw new AppError(
+            409,
+            "USER_BUSY",
+            "A participant is already on another call.",
+          );
         }
         // Recheck the caller's session and both persisted conversation members;
         // knowing a request ID never grants permission to accept it.
@@ -411,31 +463,49 @@ export function attachRealtime(io, { pool, sessionMiddleware, config }) {
           if (error.status !== 401) throw error;
           finishInvitation("call:cancelled", invitation, "disconnected");
           caller.disconnect(true);
-          throw new AppError(409, "CALLER_UNAVAILABLE", "The caller is no longer available.");
+          throw new AppError(
+            409,
+            "CALLER_UNAVAILABLE",
+            "The caller is no longer available.",
+          );
         }
         let call;
         try {
           call = await createAcceptedDirectCall(pool, invitation);
         } catch (error) {
-          if (error.status && error.status < 500) finishInvitation("call:cancelled", invitation, "unavailable");
+          if (error.status && error.status < 500)
+            finishInvitation("call:cancelled", invitation, "unavailable");
           throw error;
         }
         if (!socket.connected || !caller.connected) {
-          await pool.query('UPDATE call_rooms SET ended_at = COALESCE(ended_at, NOW()) WHERE id = $1', [call.id]);
+          await pool.query(
+            "UPDATE call_rooms SET ended_at = COALESCE(ended_at, NOW()) WHERE id = $1",
+            [call.id],
+          );
           finishInvitation("call:cancelled", invitation, "disconnected");
-          throw new AppError(409, "CALLER_UNAVAILABLE", "A participant disconnected before the call could start.");
+          throw new AppError(
+            409,
+            "CALLER_UNAVAILABLE",
+            "A participant disconnected before the call could start.",
+          );
         }
         caller.data.acceptedCallId = call.id;
         socket.data.acceptedCallId = call.id;
         try {
           await getAuthorizedCall(pool, call.id, invitation.fromUserId);
-          if (!caller.connected || !socket.connected ||
-              caller.data.acceptedCallId !== call.id || socket.data.acceptedCallId !== call.id) {
+          if (
+            !caller.connected ||
+            !socket.connected ||
+            caller.data.acceptedCallId !== call.id ||
+            socket.data.acceptedCallId !== call.id
+          ) {
             throw new AppError(409, "CALL_ENDED", "This call has ended.");
           }
         } catch (error) {
-          if (caller.data.acceptedCallId === call.id) caller.data.acceptedCallId = null;
-          if (socket.data.acceptedCallId === call.id) socket.data.acceptedCallId = null;
+          if (caller.data.acceptedCallId === call.id)
+            caller.data.acceptedCallId = null;
+          if (socket.data.acceptedCallId === call.id)
+            socket.data.acceptedCallId = null;
           finishInvitation("call:cancelled", invitation, "unavailable");
           throw error;
         }
@@ -448,13 +518,23 @@ export function attachRealtime(io, { pool, sessionMiddleware, config }) {
     );
 
     event("call:rejected", callDecisionSchema, ({ requestId }) =>
-      withCallLock(async () => finishInvitation("call:rejected",
-        pendingInvitation(requestId, socket.data.userId, "targetUserId"), "declined")),
+      withCallLock(async () =>
+        finishInvitation(
+          "call:rejected",
+          pendingInvitation(requestId, socket.data.userId, "targetUserId"),
+          "declined",
+        ),
+      ),
     );
 
     event("call:cancelled", callDecisionSchema, ({ requestId }) =>
-      withCallLock(async () => finishInvitation("call:cancelled",
-        pendingInvitation(requestId, socket.data.userId, "fromUserId"), "cancelled")),
+      withCallLock(async () =>
+        finishInvitation(
+          "call:cancelled",
+          pendingInvitation(requestId, socket.data.userId, "fromUserId"),
+          "cancelled",
+        ),
+      ),
     );
 
     event("call:sync", Joi.object({}).required(), () =>
@@ -466,8 +546,10 @@ export function attachRealtime(io, { pool, sessionMiddleware, config }) {
           invitation = null;
         }
         return {
-          incoming: invitation?.targetUserId === socket.data.userId ? invitation : null,
-          outgoing: invitation?.fromUserId === socket.data.userId ? invitation : null,
+          incoming:
+            invitation?.targetUserId === socket.data.userId ? invitation : null,
+          outgoing:
+            invitation?.fromUserId === socket.data.userId ? invitation : null,
         };
       }),
     );
@@ -505,11 +587,21 @@ export function attachRealtime(io, { pool, sessionMiddleware, config }) {
             "ALREADY_IN_CALL",
             "Leave your current call before joining another.",
           );
-        if (pendingByUser.has(socket.data.userId) ||
-            (socket.data.acceptedCallId && socket.data.acceptedCallId !== callId) ||
-            userSockets(socket.data.userId).some((other) =>
-              other.id !== socket.id && (other.data.callId || other.data.acceptedCallId))) {
-          throw new AppError(409, "ALREADY_IN_CALL", "Finish your current call before joining another.");
+        if (
+          pendingByUser.has(socket.data.userId) ||
+          (socket.data.acceptedCallId &&
+            socket.data.acceptedCallId !== callId) ||
+          userSockets(socket.data.userId).some(
+            (other) =>
+              other.id !== socket.id &&
+              (other.data.callId || other.data.acceptedCallId),
+          )
+        ) {
+          throw new AppError(
+            409,
+            "ALREADY_IN_CALL",
+            "Finish your current call before joining another.",
+          );
         }
         const call = await getAuthorizedCall(pool, callId, socket.data.userId);
         const room = `call:${callId}`;
@@ -575,7 +667,11 @@ export function attachRealtime(io, { pool, sessionMiddleware, config }) {
 
     event("call:leave", callSchema, ({ callId }) =>
       withCallLock(async () => {
-        if (socket.data.callId === callId || socket.data.acceptedCallId === callId) await leaveCall(socket);
+        if (
+          socket.data.callId === callId ||
+          socket.data.acceptedCallId === callId
+        )
+          await leaveCall(socket);
         return { callId };
       }),
     );
@@ -630,9 +726,15 @@ export function attachRealtime(io, { pool, sessionMiddleware, config }) {
       clearTimeout(sessionTimer);
       // Socket.IO already removed the room; the stored call ID lets remaining peers clean up.
       void withCallLock(async () => {
-        const invitation = pendingCalls.get(pendingByUser.get(socket.data.userId))?.invitation;
-        if (invitation && (invitation.callerSocketId === socket.id ||
-            (invitation.targetUserId === socket.data.userId && !userSockets(socket.data.userId).length))) {
+        const invitation = pendingCalls.get(
+          pendingByUser.get(socket.data.userId),
+        )?.invitation;
+        if (
+          invitation &&
+          (invitation.callerSocketId === socket.id ||
+            (invitation.targetUserId === socket.data.userId &&
+              !userSockets(socket.data.userId).length))
+        ) {
           finishInvitation("call:cancelled", invitation, "disconnected");
         }
         await leaveCall(socket);

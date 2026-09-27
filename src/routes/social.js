@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Router } from "express";
 import multer from "multer";
 import Joi from "joi";
@@ -14,7 +15,7 @@ import {
 } from "../services/chat.js";
 
 const uploadDir = new URL("../../uploads", import.meta.url);
-const resolvedUploadDir = new URL("../../uploads", import.meta.url).pathname;
+const resolvedUploadDir = fileURLToPath(uploadDir);
 if (!fs.existsSync(resolvedUploadDir)) {
   fs.mkdirSync(resolvedUploadDir, { recursive: true });
 }
@@ -60,6 +61,14 @@ const conversationSchema = Joi.object({
     .max(5)
     .required(),
   title: Joi.string().trim().min(1).max(120),
+}).unknown(false);
+
+const conversationUpdateSchema = Joi.object({
+  title: Joi.string().trim().min(1).max(120).required(),
+}).unknown(false);
+
+const conversationMemberSchema = Joi.object({
+  memberId: Joi.string().uuid().lowercase().required(),
 }).unknown(false);
 
 const messageBodySchema = Joi.object({
@@ -117,6 +126,45 @@ async function conversationMembers(pool, id) {
     [id],
   );
   return rows;
+}
+
+async function groupMembership(pool, conversationId, userId) {
+  const { rows } = await pool.query(
+    `SELECT c.id, c.kind, c.created_by AS "createdBy", cm.role AS "membershipRole"
+       FROM conversations c
+       JOIN conversation_members cm ON cm.conversation_id = c.id
+      WHERE c.id = $1 AND cm.user_id = $2`,
+    [conversationId, userId],
+  );
+  const conversation = rows[0];
+  if (!conversation) {
+    throw new AppError(
+      404,
+      "CONVERSATION_NOT_FOUND",
+      "Conversation not found.",
+    );
+  }
+  if (conversation.kind !== "group") {
+    throw new AppError(
+      400,
+      "GROUP_REQUIRED",
+      "This action requires a group conversation.",
+    );
+  }
+  return conversation;
+}
+
+function requireGroupOwner(conversation, userId) {
+  if (
+    conversation.createdBy.toLowerCase() !== userId.toLowerCase() ||
+    conversation.membershipRole !== "owner"
+  ) {
+    throw new AppError(
+      403,
+      "GROUP_OWNER_REQUIRED",
+      "Only the group owner can manage this group.",
+    );
+  }
 }
 
 export function socialRoutes({ pool, io }) {
@@ -536,6 +584,112 @@ export function socialRoutes({ pool, io }) {
       [req.user.id, limit, offset],
     );
     res.json({ conversations: rows, limit, offset });
+  });
+
+  router.patch("/conversations/:id", async (req, res) => {
+    const conversationId = uuid(req.params.id);
+    const input = validate(conversationUpdateSchema, req.body);
+    const conversation = await groupMembership(
+      pool,
+      conversationId,
+      req.user.id,
+    );
+    requireGroupOwner(conversation, req.user.id);
+    const { rows } = await pool.query(
+      `UPDATE conversations SET title = $2
+        WHERE id = $1
+        RETURNING id, kind, title, created_by AS "createdBy", created_at AS "createdAt"`,
+      [conversationId, input.title],
+    );
+    res.json({
+      conversation: {
+        ...rows[0],
+        members: await conversationMembers(pool, conversationId),
+      },
+    });
+  });
+
+  router.post("/conversations/:id/members", async (req, res) => {
+    const conversationId = uuid(req.params.id);
+    const { memberId } = validate(conversationMemberSchema, req.body);
+    const conversation = await groupMembership(
+      pool,
+      conversationId,
+      req.user.id,
+    );
+    requireGroupOwner(conversation, req.user.id);
+    await assertUserExists(pool, memberId);
+    const result = await pool.query(
+      `INSERT INTO conversation_members (conversation_id, user_id, role)
+       VALUES ($1, $2, 'member') ON CONFLICT (conversation_id, user_id) DO NOTHING
+       RETURNING conversation_id AS "conversationId", user_id AS "userId"`,
+      [conversationId, memberId],
+    );
+    if (!result.rows.length) {
+      throw new AppError(
+        409,
+        "ALREADY_MEMBER",
+        "This user is already in the group.",
+      );
+    }
+    const members = await conversationMembers(pool, conversationId);
+    io.to(`user:${memberId}`).emit("conversation:new", {
+      id: conversationId,
+      kind: "group",
+      members,
+    });
+    res.status(201).json({ members });
+  });
+
+  router.delete("/conversations/:id/members/:userId", async (req, res) => {
+    const conversationId = uuid(req.params.id);
+    const memberId = uuid(req.params.userId);
+    const conversation = await groupMembership(
+      pool,
+      conversationId,
+      req.user.id,
+    );
+    if (memberId.toLowerCase() !== req.user.id.toLowerCase()) {
+      requireGroupOwner(conversation, req.user.id);
+    }
+    if (memberId.toLowerCase() === conversation.createdBy.toLowerCase()) {
+      throw new AppError(
+        400,
+        "OWNER_CANNOT_LEAVE",
+        "Transfer ownership before leaving the group.",
+      );
+    }
+    const result = await pool.query(
+      `DELETE FROM conversation_members
+        WHERE conversation_id = $1 AND user_id = $2
+        RETURNING user_id`,
+      [conversationId, memberId],
+    );
+    if (!result.rows.length) {
+      throw new AppError(
+        404,
+        "MEMBER_NOT_FOUND",
+        "That user is not a member of this group.",
+      );
+    }
+    res.status(204).send();
+  });
+
+  router.delete("/conversations/:id", async (req, res) => {
+    const conversationId = uuid(req.params.id);
+    const conversation = await groupMembership(
+      pool,
+      conversationId,
+      req.user.id,
+    );
+    requireGroupOwner(conversation, req.user.id);
+    await pool.query("DELETE FROM call_rooms WHERE conversation_id = $1", [
+      conversationId,
+    ]);
+    await pool.query("DELETE FROM conversations WHERE id = $1", [
+      conversationId,
+    ]);
+    res.status(204).send();
   });
 
   router.get("/conversations/:id/messages", async (req, res) => {
