@@ -19,20 +19,27 @@ const resolvedUploadDir = fileURLToPath(uploadDir);
 if (!fs.existsSync(resolvedUploadDir)) {
   fs.mkdirSync(resolvedUploadDir, { recursive: true });
 }
+const privateUploadDir = fileURLToPath(
+  new URL("../../private-uploads/messages", import.meta.url),
+);
+if (!fs.existsSync(privateUploadDir)) {
+  fs.mkdirSync(privateUploadDir, { recursive: true });
+}
 
+const diskStorage = multer.diskStorage({
+  destination: (_req, _file, callback) => {
+    callback(null, resolvedUploadDir);
+  },
+  filename: (_req, file, callback) => {
+    const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const extension =
+      path.extname(safeName) ||
+      (file.mimetype.startsWith("video/") ? ".mp4" : ".png");
+    callback(null, `${Date.now()}-${randomUUID()}${extension}`);
+  },
+});
 const upload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, callback) => {
-      callback(null, resolvedUploadDir);
-    },
-    filename: (_req, file, callback) => {
-      const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
-      const extension =
-        path.extname(safeName) ||
-        (file.mimetype.startsWith("video/") ? ".mp4" : ".png");
-      callback(null, `${Date.now()}-${randomUUID()}${extension}`);
-    },
-  }),
+  storage: diskStorage,
   limits: { fileSize: 25 * 1024 * 1024 },
   fileFilter: (_req, file, callback) => {
     if (
@@ -50,6 +57,17 @@ const upload = multer({
       ),
     );
   },
+});
+const messageUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, callback) => callback(null, privateUploadDir),
+    filename: (_req, file, callback) => {
+      const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
+      const extension = path.extname(safeName) || ".bin";
+      callback(null, `${Date.now()}-${randomUUID()}${extension}`);
+    },
+  }),
+  limits: { fileSize: 25 * 1024 * 1024 },
 });
 
 const conversationSchema = Joi.object({
@@ -73,6 +91,13 @@ const conversationMemberSchema = Joi.object({
 
 const messageBodySchema = Joi.object({
   body: Joi.string().trim().min(1).max(4000).required(),
+}).unknown(false);
+
+const reactionEmojis = ["❤️", "😂", "👍", "😮", "😢", "👏"];
+const messageReactionSchema = Joi.object({
+  emoji: Joi.string()
+    .valid(...reactionEmojis)
+    .required(),
 }).unknown(false);
 
 const commentSchema = Joi.object({
@@ -698,7 +723,13 @@ export function socialRoutes({ pool, io }) {
     await assertConversationMember(pool, conversationId, req.user.id);
     const { rows } = await pool.query(
       `SELECT id, conversation_id AS "conversationId", sender_id AS "senderId",
-              body, created_at AS "createdAt"
+              body, attachment_name AS "attachmentName",
+              attachment_url AS "attachmentUrl", attachment_mime AS "attachmentMime",
+              attachment_size AS "attachmentSize", created_at AS "createdAt",
+              COALESCE((
+                SELECT json_agg(json_build_object('emoji', r.emoji, 'userId', r.user_id))
+                  FROM message_reactions r WHERE r.message_id = messages.id
+              ), '[]'::json) AS reactions
          FROM messages WHERE conversation_id = $1
         ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`,
       [conversationId, limit, offset],
@@ -716,6 +747,114 @@ export function socialRoutes({ pool, io }) {
     await deliverMessage(io, pool, message);
     res.status(201).json({ message });
   });
+
+  router.post(
+    "/conversations/:id/messages/attachment",
+    async (req, _res, next) => {
+      try {
+        await assertConversationMember(pool, req.params.id, req.user.id);
+        next();
+      } catch (error) {
+        next(error);
+      }
+    },
+    messageUpload.single("file"),
+    async (req, res) => {
+      try {
+        const body = (req.body?.body ?? "").trim();
+        if (body) validate(messageBodySchema, { body });
+        if (!body && !req.file) {
+          throw new AppError(400, "MESSAGE_REQUIRED", "Add a message or file.");
+        }
+        const message = await sendMessage(pool, {
+          conversationId: req.params.id,
+          senderId: req.user.id,
+          body,
+          attachmentName: req.file?.originalname.slice(0, 255) ?? null,
+          attachmentUrl: req.file?.filename ?? null,
+          attachmentMime: req.file?.mimetype ?? null,
+          attachmentSize: req.file?.size ?? null,
+        });
+        await deliverMessage(io, pool, message);
+        res.status(201).json({ message });
+      } catch (error) {
+        if (req.file) await fs.promises.unlink(req.file.path).catch(() => {});
+        throw error;
+      }
+    },
+  );
+
+  router.get(
+    "/conversations/:id/messages/:messageId/attachment",
+    async (req, res) => {
+      const conversationId = uuid(req.params.id);
+      const messageId = uuid(req.params.messageId);
+      await assertConversationMember(pool, conversationId, req.user.id);
+      const { rows } = await pool.query(
+        `SELECT attachment_url AS "attachmentUrl",
+                attachment_name AS "attachmentName",
+                attachment_mime AS "attachmentMime"
+           FROM messages WHERE id = $1 AND conversation_id = $2`,
+        [messageId, conversationId],
+      );
+      const attachment = rows[0];
+      if (!attachment?.attachmentUrl) {
+        throw new AppError(404, "ATTACHMENT_NOT_FOUND", "File not found.");
+      }
+      const filename = path.basename(attachment.attachmentUrl);
+      if (filename !== attachment.attachmentUrl) {
+        throw new AppError(404, "ATTACHMENT_NOT_FOUND", "File not found.");
+      }
+      if (req.query.inline === "true") {
+        res.type(attachment.attachmentMime || "application/octet-stream");
+        res.set("Content-Disposition", "inline; filename=attachment");
+        res.sendFile(filename, { root: privateUploadDir });
+        return;
+      }
+      res.download(filename, attachment.attachmentName || "attachment", {
+        root: privateUploadDir,
+      });
+    },
+  );
+
+  router.post(
+    "/conversations/:id/messages/:messageId/reactions",
+    async (req, res) => {
+      const conversationId = uuid(req.params.id);
+      const messageId = uuid(req.params.messageId);
+      const { emoji } = validate(messageReactionSchema, req.body);
+      await assertConversationMember(pool, conversationId, req.user.id);
+      const message = await pool.query(
+        "SELECT id FROM messages WHERE id = $1 AND conversation_id = $2",
+        [messageId, conversationId],
+      );
+      if (!message.rows.length) {
+        throw new AppError(404, "MESSAGE_NOT_FOUND", "Message not found.");
+      }
+
+      const inserted = await pool.query(
+        `INSERT INTO message_reactions (message_id, user_id, emoji)
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING message_id`,
+        [messageId, req.user.id, emoji],
+      );
+      const active = inserted.rows.length > 0;
+      if (!active) {
+        await pool.query(
+          "DELETE FROM message_reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3",
+          [messageId, req.user.id, emoji],
+        );
+      }
+      const { rows: members } = await pool.query(
+        "SELECT user_id FROM conversation_members WHERE conversation_id = $1",
+        [conversationId],
+      );
+      io.to(members.map(({ user_id }) => `user:${user_id}`)).emit(
+        "message:reaction",
+        { conversationId, messageId, userId: req.user.id, emoji, active },
+      );
+      res.json({ active, userId: req.user.id, emoji });
+    },
+  );
 
   return router;
 }

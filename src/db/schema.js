@@ -2,6 +2,7 @@ import { sql } from "drizzle-orm";
 import {
   check,
   index,
+  integer,
   json,
   pgTable,
   primaryKey,
@@ -179,6 +180,10 @@ export const messages = pgTable(
       .notNull()
       .references(() => users.id),
     body: varchar("body", { length: 4000 }).notNull(),
+    attachmentName: text("attachment_name"),
+    attachmentUrl: text("attachment_url"),
+    attachmentMime: text("attachment_mime"),
+    attachmentSize: integer("attachment_size"),
     createdAt,
   },
   (table) => [
@@ -187,7 +192,28 @@ export const messages = pgTable(
       table.createdAt,
       table.id,
     ),
-    check("messages_body_check", sql`length(trim(${table.body})) > 0`),
+    check(
+      "messages_content_check",
+      sql`length(trim(${table.body})) > 0 or ${table.attachmentUrl} is not null`,
+    ),
+  ],
+);
+
+export const messageReactions = pgTable(
+  "message_reactions",
+  {
+    messageId: uuid("message_id")
+      .notNull()
+      .references(() => messages.id, { onDelete: "cascade" }),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    emoji: varchar("emoji", { length: 16 }).notNull(),
+    createdAt,
+  },
+  (table) => [
+    primaryKey({ columns: [table.messageId, table.userId, table.emoji] }),
+    index("message_reactions_message").on(table.messageId),
   ],
 );
 

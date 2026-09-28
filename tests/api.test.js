@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
+import { unlink } from "node:fs/promises";
 import request from "supertest";
 import { createFixture, testPool } from "./helpers.js";
 import { migrate } from "../src/db/migrate.js";
@@ -157,6 +158,47 @@ test("following, direct/group conversations and persisted messages enforce membe
     .request("get", `/api/conversations/${conversationId}/messages`)
     .expect(200);
   assert.equal(history.body.messages[0].body, "Hello Bob");
+  const messageId = sent.body.message.id;
+  const reactionPath = `/api/conversations/${conversationId}/messages/${messageId}/reactions`;
+  await bob
+    .request("post", reactionPath, { emoji: "❤️" })
+    .expect(200, { active: true, userId: bob.id, emoji: "❤️" });
+  const reactedHistory = await alice
+    .request("get", `/api/conversations/${conversationId}/messages`)
+    .expect(200);
+  assert.deepEqual(reactedHistory.body.messages[0].reactions, [
+    { emoji: "❤️", userId: bob.id },
+  ]);
+  await bob
+    .request("post", reactionPath, { emoji: "❤️" })
+    .expect(200, { active: false, userId: bob.id, emoji: "❤️" });
+  await outsider.request("post", reactionPath, { emoji: "😂" }).expect(404);
+
+  const uploaded = await alice
+    .request("post", `/api/conversations/${conversationId}/messages/attachment`)
+    .attach("file", Buffer.from("voice note"), {
+      filename: "session-voice.webm",
+      contentType: "audio/webm",
+    })
+    .expect(201);
+  const attachment = uploaded.body.message;
+  assert.equal(attachment.body, "");
+  assert.equal(attachment.attachmentName, "session-voice.webm");
+  assert.equal(attachment.attachmentMime, "audio/webm");
+  const attachmentPath = `/api/conversations/${conversationId}/messages/${attachment.id}/attachment`;
+  t.after(() =>
+    unlink(
+      new URL(
+        `../private-uploads/messages/${attachment.attachmentUrl}`,
+        import.meta.url,
+      ),
+    ).catch(() => {}),
+  );
+  await bob
+    .request("get", attachmentPath)
+    .expect(200)
+    .expect("Content-Disposition", /attachment/);
+  await outsider.request("get", attachmentPath).expect(404);
   await bob
     .request("get", `/api/conversations/${conversationId}/messages?limit=-1`)
     .expect(400);
