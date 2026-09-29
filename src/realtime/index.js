@@ -92,9 +92,10 @@ async function refreshIdentity(socket, pool) {
   }
   const {
     rows: [user],
-  } = await pool.query("SELECT id, full_name FROM users WHERE id = $1", [
-    session.userId,
-  ]);
+  } = await pool.query(
+    'SELECT id, full_name, role, avatar_url AS "avatarUrl" FROM users WHERE id = $1 AND deleted_at IS NULL',
+    [session.userId],
+  );
   if (!user) throw new AppError(401, "UNAUTHENTICATED", "Please sign in.");
   if (socket.data.userId && socket.data.userId !== user.id)
     throw new AppError(
@@ -104,6 +105,13 @@ async function refreshIdentity(socket, pool) {
     );
   socket.data.userId = user.id;
   socket.data.fullName = user.full_name;
+  const previousRole = socket.data.role;
+  socket.data.role = user.role;
+  socket.data.avatarUrl = user.avatarUrl;
+  if (socket.connected && previousRole && previousRole !== user.role) {
+    await socket.leave(`role:${previousRole}`);
+    await socket.join(`role:${user.role}`);
+  }
   return user;
 }
 
@@ -112,6 +120,7 @@ function peerInfo(socket) {
     socketId: socket.id,
     userId: socket.data.userId,
     fullName: socket.data.fullName,
+    ...(socket.data.avatarUrl ? { avatarUrl: socket.data.avatarUrl } : {}),
   };
 }
 
@@ -273,6 +282,7 @@ export function attachRealtime(io, { pool, sessionMiddleware, config }) {
 
   io.on("connection", (socket) => {
     socket.join(`user:${socket.data.userId}`);
+    socket.join(`role:${socket.data.role}`);
     socket.join(`session:${socket.request.sessionID}`);
     let chain = Promise.resolve();
     let queued = 0;

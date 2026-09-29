@@ -107,7 +107,7 @@ async function readBooking(client, id) {
   return result.rows[0];
 }
 
-export function counsellorRoutes({ pool }) {
+export function counsellorRoutes({ pool, io }) {
   const router = Router();
   router.use(requireUser);
 
@@ -117,9 +117,10 @@ export function counsellorRoutes({ pool }) {
     // Escape LIKE metacharacters so ordinary search text is matched literally.
     const pattern = `%${search.replace(/[\\%_]/g, "\\$&")}%`;
     const result = await pool.query(
-      `SELECT id, full_name AS "fullName", bio, specialties
+      `SELECT id, full_name AS "fullName", bio, specialties,
+              avatar_url AS "avatarUrl"
        FROM users
-       WHERE role = 'counsellor'
+      WHERE role = 'counsellor' AND deleted_at IS NULL
          AND ($1 = '' OR full_name ILIKE $2 OR EXISTS (
            SELECT 1 FROM unnest(specialties) specialty WHERE specialty ILIKE $2
          ))
@@ -157,13 +158,17 @@ export function counsellorRoutes({ pool }) {
       );
       return result.rows[0];
     });
+    io?.to(["role:client", `user:${req.user.id}`]).emit(
+      "availability:created",
+      slot,
+    );
     res.status(201).json({ slot });
   });
 
   router.delete("/availability/:slotId", async (req, res) => {
     requireRole(req, "counsellor");
     const slotId = uuid(req.params.slotId);
-    await transaction(pool, async (client) => {
+    const deletedSlot = await transaction(pool, async (client) => {
       await lockUsers(client, [req.user.id]);
       const slot = await client.query(
         `SELECT id FROM availability_slots
@@ -188,11 +193,17 @@ export function counsellorRoutes({ pool }) {
           "Cancel the active booking before removing this slot.",
         );
       }
-      await client.query(
-        "UPDATE availability_slots SET deleted_at = NOW() WHERE id = $1",
+      const result = await client.query(
+        `UPDATE availability_slots SET deleted_at = NOW()
+         WHERE id = $1 RETURNING ${slotFields}`,
         [slotId],
       );
+      return result.rows[0];
     });
+    io?.to(["role:client", `user:${req.user.id}`]).emit(
+      "availability:deleted",
+      { slotId, counsellorId: deletedSlot.counsellorId },
+    );
     res.status(204).end();
   });
 
@@ -200,7 +211,7 @@ export function counsellorRoutes({ pool }) {
     const counsellorId = uuid(req.params.id);
     const { limit, offset } = pagination(req.query);
     const counsellor = await pool.query(
-      "SELECT id FROM users WHERE id = $1 AND role = 'counsellor'",
+      "SELECT id FROM users WHERE id = $1 AND role = 'counsellor' AND deleted_at IS NULL",
       [counsellorId],
     );
     if (!counsellor.rows.length) {
@@ -323,6 +334,15 @@ export function bookingRoutes({ pool, io }) {
       }
       throw error;
     }
+    io?.to([
+      `user:${booking.clientId}`,
+      `user:${booking.counsellorId}`,
+      "role:admin",
+    ]).emit("booking:created", booking);
+    io?.to("role:client").emit("availability:changed", {
+      counsellorId: booking.counsellorId,
+      slotId: booking.slotId,
+    });
     res.status(201).json({ booking });
   });
 
@@ -411,6 +431,17 @@ export function bookingRoutes({ pool, io }) {
     if (io) {
       for (const { id: roomId } of result.endedRooms) {
         await closeCallRoom(io, roomId, `booking_${status}`);
+      }
+      io.to([
+        `user:${result.booking.clientId}`,
+        `user:${result.booking.counsellorId}`,
+        "role:admin",
+      ]).emit("booking:updated", result.booking);
+      if (result.booking.status === "cancelled") {
+        io.to("role:client").emit("availability:changed", {
+          counsellorId: result.booking.counsellorId,
+          slotId: result.booking.slotId,
+        });
       }
     }
     res.json({ booking: result.booking });

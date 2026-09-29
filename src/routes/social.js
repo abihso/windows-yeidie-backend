@@ -127,10 +127,15 @@ const postSchema = Joi.object({
   .unknown(false);
 
 const publicProfileColumns = `u.id, u.full_name AS "fullName", u.role,
-                              u.bio, u.specialties, u.created_at AS "createdAt"`;
+                              u.bio, u.specialties,
+                              u.avatar_url AS "avatarUrl",
+                              u.created_at AS "createdAt"`;
 
 async function assertUserExists(pool, id) {
-  const { rows } = await pool.query("SELECT id FROM users WHERE id = $1", [id]);
+  const { rows } = await pool.query(
+    "SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL",
+    [id],
+  );
   if (!rows.length)
     throw new AppError(404, "USER_NOT_FOUND", "User not found.");
 }
@@ -234,7 +239,7 @@ export function socialRoutes({ pool, io }) {
       const { rows } = await pool.query(
         `SELECT ${publicProfileColumns}
            FROM follows f JOIN users u ON u.id = f.${profileColumn}
-          WHERE f.${ownerColumn} = $1
+          WHERE f.${ownerColumn} = $1 AND u.deleted_at IS NULL
           ORDER BY f.created_at DESC, u.id
           LIMIT $2 OFFSET $3`,
         [userId, limit, offset],
@@ -262,6 +267,7 @@ export function socialRoutes({ pool, io }) {
         )
       SELECT p.id, p.body, p.media_type AS "mediaType", p.media_url AS "mediaUrl", p.created_at AS "createdAt",
              u.id AS "authorId", u.full_name AS "authorFullName", u.role AS "authorRole",
+             u.avatar_url AS "authorAvatarUrl",
              COALESCE(lc.likes, 0) AS likes,
              COALESCE(rc.reposts, 0) AS reposts,
              COALESCE(sc.saves, 0) AS saves,
@@ -289,7 +295,8 @@ export function socialRoutes({ pool, io }) {
     if (postIds.length) {
       const { rows: commentRows } = await pool.query(
         `SELECT c.id, c.post_id AS "postId", c.body, c.created_at AS "createdAt",
-                u.id AS "authorId", u.full_name AS "authorFullName", u.role AS "authorRole"
+                u.id AS "authorId", u.full_name AS "authorFullName", u.role AS "authorRole",
+                u.avatar_url AS "authorAvatarUrl"
            FROM post_comments c
            JOIN users u ON u.id = c.author_id
           WHERE c.post_id = ANY($1)
@@ -306,6 +313,7 @@ export function socialRoutes({ pool, io }) {
             id: comment.authorId,
             fullName: comment.authorFullName,
             role: comment.authorRole,
+            avatarUrl: comment.authorAvatarUrl,
           },
         });
         commentsByPost.set(comment.postId, list);
@@ -330,6 +338,7 @@ export function socialRoutes({ pool, io }) {
           id: row.authorId,
           fullName: row.authorFullName,
           role: row.authorRole,
+          avatarUrl: row.authorAvatarUrl,
         },
       })),
     });
@@ -447,6 +456,7 @@ export function socialRoutes({ pool, io }) {
           id: req.user.id,
           fullName: req.user.fullName,
           role: req.user.role,
+          avatarUrl: req.user.avatarUrl,
         },
       },
     });
@@ -488,6 +498,7 @@ export function socialRoutes({ pool, io }) {
           id: req.user.id,
           fullName: req.user.fullName,
           role: req.user.role,
+          avatarUrl: req.user.avatarUrl,
         },
       },
     });
@@ -530,7 +541,7 @@ export function socialRoutes({ pool, io }) {
       async (client) => {
         const members = [userId, ...input.memberIds];
         const existingUsers = await client.query(
-          "SELECT id FROM users WHERE id = ANY($1::uuid[])",
+          "SELECT id FROM users WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL",
           [members],
         );
         if (existingUsers.rows.length !== members.length) {
@@ -590,6 +601,7 @@ export function socialRoutes({ pool, io }) {
       `SELECT c.id, c.kind, c.title, c.created_by AS "createdBy", c.created_at AS "createdAt",
               (SELECT json_agg(json_build_object(
                   'id', u.id, 'fullName', u.full_name, 'role', u.role,
+                  'avatarUrl', u.avatar_url,
                   'membershipRole', cm.role
                 ) ORDER BY cm.joined_at, u.id)
                  FROM conversation_members cm JOIN users u ON u.id = cm.user_id

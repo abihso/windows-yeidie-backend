@@ -7,6 +7,8 @@ import { rateLimit } from "express-rate-limit";
 import { AppError } from "../lib/errors.js";
 import { validate } from "../lib/validation.js";
 import { ensureCsrfToken, requireAuth } from "../middleware/auth.js";
+import { transaction } from "../db/transaction.js";
+import { removeAvatarFile } from "./users.js";
 
 const password = Joi.string()
   .min(10)
@@ -22,7 +24,7 @@ const email = Joi.string()
   .email({ tlds: { allow: false } })
   .max(254);
 const publicColumns =
-  'id, full_name AS "fullName", email, role, bio, specialties, created_at AS "createdAt"';
+  'id, full_name AS "fullName", email, role, bio, specialties, avatar_url AS "avatarUrl", created_at AS "createdAt"';
 // A valid hash makes missing-account login attempts do the same bcrypt work.
 const dummyHash = bcrypt.hashSync("not-a-real-account-password", 12);
 
@@ -82,7 +84,8 @@ export function authRoutes({ pool, io, config }) {
       req.body,
     );
     const { rows } = await pool.query(
-      `SELECT ${publicColumns}, password_hash FROM users WHERE email = $1`,
+      `SELECT ${publicColumns}, password_hash FROM users
+       WHERE email = $1 AND deleted_at IS NULL`,
       [data.email],
     );
     const user = rows[0];
@@ -141,6 +144,62 @@ export function authRoutes({ pool, io, config }) {
       req.user.id,
       hash,
     ]);
+    res.status(204).end();
+  });
+  router.delete("/account", requireAuth(pool), async (req, res) => {
+    const { password: currentPassword } = validate(
+      Joi.object({ password: password.required() }).required(),
+      req.body,
+    );
+    const deletion = await transaction(pool, async (client) => {
+      const { rows } = await client.query(
+        "SELECT password_hash, avatar_url FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+        [req.user.id],
+      );
+      if (
+        !rows[0] ||
+        !(await bcrypt.compare(currentPassword, rows[0].password_hash))
+      ) {
+        throw new AppError(
+          400,
+          "INVALID_PASSWORD",
+          "Current password is incorrect.",
+        );
+      }
+
+      const { rows: sessions } = await client.query(
+        "DELETE FROM user_sessions WHERE sess->>'userId' = $1 RETURNING sid",
+        [req.user.id],
+      );
+      await client.query(
+        `UPDATE users
+         SET full_name = 'Deleted user', email = $2, password_hash = $3,
+           bio = '', specialties = '{}'::text[], avatar_url = NULL,
+           deleted_at = NOW()
+         WHERE id = $1`,
+        [
+          req.user.id,
+          `deleted+${req.user.id}@deleted.invalid`,
+          await bcrypt.hash(randomUUID(), 12),
+        ],
+      );
+      return {
+        sessionIds: sessions.map(({ sid }) => sid),
+        avatarUrl: rows[0].avatar_url,
+      };
+    });
+
+    for (const sessionId of new Set([...deletion.sessionIds, req.sessionID])) {
+      io.in(`session:${sessionId}`).disconnectSockets(true);
+    }
+    await removeAvatarFile(deletion.avatarUrl);
+    await promisify(req.session.destroy).call(req.session);
+    res.clearCookie("yiedie.sid", {
+      httpOnly: true,
+      secure: config.production,
+      sameSite: config.sameSite,
+      path: "/",
+    });
     res.status(204).end();
   });
   router.post("/logout", async (req, res) => {

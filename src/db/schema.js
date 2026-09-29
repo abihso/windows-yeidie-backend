@@ -30,7 +30,9 @@ export const users = pgTable(
       .array()
       .notNull()
       .default(sql`'{}'`),
+    avatarUrl: text("avatar_url"),
     createdAt,
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
   },
   (table) => [
     uniqueIndex("users_email_unique").on(table.email),

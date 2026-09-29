@@ -101,6 +101,158 @@ test("authentication, CSRF, sessions and public profiles protect private data", 
   assert.equal(login.body.user.password_hash, undefined);
 });
 
+test("users can upload and replace profile pictures with validated images", async (t) => {
+  const f = await createFixture(t);
+  const alice = await f.account("client", "Alice Example");
+  const bob = await f.account("client", "Bob Example");
+  const firstImage = Buffer.from([0xff, 0xd8, 0xff, 0x00]);
+  const firstUpload = await alice.agent
+    .post("/api/users/me/avatar")
+    .set("X-CSRF-Token", alice.csrfToken)
+    .attach("avatar", firstImage, {
+      filename: "profile.jpg",
+      contentType: "image/jpeg",
+    })
+    .expect(200);
+  const firstAvatarUrl = firstUpload.body.user.avatarUrl;
+  const firstFilename = firstAvatarUrl.split("/").pop();
+  t.after(() =>
+    unlink(new URL(`../uploads/${firstFilename}`, import.meta.url)).catch(
+      () => {},
+    ),
+  );
+  assert.match(firstAvatarUrl, /^\/uploads\/[\w-]+\.jpg$/);
+  const currentUser = await alice.request("get", "/api/auth/me").expect(200);
+  assert.equal(currentUser.body.user.avatarUrl, firstAvatarUrl);
+  await request(f.app).get(firstAvatarUrl).expect(200);
+
+  const secondImage = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  const secondUpload = await alice.agent
+    .post("/api/users/me/avatar")
+    .set("X-CSRF-Token", alice.csrfToken)
+    .attach("avatar", secondImage, {
+      filename: "profile.png",
+      contentType: "image/png",
+    })
+    .expect(200);
+  const secondAvatarUrl = secondUpload.body.user.avatarUrl;
+  const secondFilename = secondAvatarUrl.split("/").pop();
+  t.after(() =>
+    unlink(new URL(`../uploads/${secondFilename}`, import.meta.url)).catch(
+      () => {},
+    ),
+  );
+  assert.notEqual(secondAvatarUrl, firstAvatarUrl);
+  await request(f.app).get(firstAvatarUrl).expect(404);
+  await request(f.app).get(secondAvatarUrl).expect(200);
+
+  const publicProfile = await bob
+    .request("get", `/api/users/${alice.id}`)
+    .expect(200);
+  assert.equal(publicProfile.body.user.avatarUrl, secondAvatarUrl);
+  const createdPost = await alice
+    .request("post", "/api/posts", { body: "A post with my real avatar." })
+    .expect(201);
+  assert.equal(createdPost.body.post.author.avatarUrl, secondAvatarUrl);
+  const createdComment = await bob
+    .request("post", `/api/posts/${createdPost.body.post.id}/comments`, {
+      body: "A comment from another account.",
+    })
+    .expect(201);
+  assert.equal(createdComment.body.comment.author.avatarUrl, null);
+  const feed = await bob.request("get", "/api/posts").expect(200);
+  assert.equal(feed.body.posts[0].author.avatarUrl, secondAvatarUrl);
+  assert.equal(feed.body.posts[0].comments[0].author.avatarUrl, null);
+  const direct = await alice.request("post", "/api/conversations", {
+    kind: "direct",
+    memberIds: [bob.id],
+  });
+  assert.equal(
+    direct.body.conversation.members.find((member) => member.id === alice.id)
+      .avatarUrl,
+    secondAvatarUrl,
+  );
+
+  const counsellor = await f.account("counsellor", "Counsellor Example");
+  const counsellorImage = await counsellor.agent
+    .post("/api/users/me/avatar")
+    .set("X-CSRF-Token", counsellor.csrfToken)
+    .attach("avatar", Buffer.from([0xff, 0xd8, 0xff, 0x01]), {
+      filename: "counsellor.jpg",
+      contentType: "image/jpeg",
+    })
+    .expect(200);
+  const counsellorAvatarUrl = counsellorImage.body.user.avatarUrl;
+  const counsellorFilename = counsellorAvatarUrl.split("/").pop();
+  t.after(() =>
+    unlink(new URL(`../uploads/${counsellorFilename}`, import.meta.url)).catch(
+      () => {},
+    ),
+  );
+  const discovery = await bob.request("get", "/api/counsellors").expect(200);
+  assert.equal(
+    discovery.body.counsellors.find((person) => person.id === counsellor.id)
+      .avatarUrl,
+    counsellorAvatarUrl,
+  );
+
+  await alice.agent
+    .post("/api/users/me/avatar")
+    .set("X-CSRF-Token", alice.csrfToken)
+    .attach("avatar", Buffer.from("not an image"), {
+      filename: "invalid.png",
+      contentType: "image/png",
+    })
+    .expect(400);
+});
+
+test("account deletion anonymizes identity, revokes access, and preserves shared history", async (t) => {
+  const f = await createFixture(t);
+  const alice = await f.account("client", "Alice Example");
+  const bob = await f.account("client", "Bob Example");
+  const direct = await alice.request("post", "/api/conversations", {
+    kind: "direct",
+    memberIds: [bob.id],
+  });
+  const conversationId = direct.body.conversation.id;
+  await alice
+    .request("post", `/api/conversations/${conversationId}/messages`, {
+      body: "Please keep this shared history.",
+    })
+    .expect(201);
+
+  await alice
+    .request("delete", "/api/auth/account", { password: "wrong-password-123" })
+    .expect(400);
+  await alice.request("get", "/api/auth/me").expect(200);
+
+  await alice
+    .request("delete", "/api/auth/account", { password: alice.password })
+    .expect(204);
+  await alice.agent.get("/api/auth/me").expect(401);
+  await bob.request("get", `/api/users/${alice.id}`).expect(404);
+  const history = await bob
+    .request("get", `/api/conversations/${conversationId}/messages`)
+    .expect(200);
+  assert.equal(
+    history.body.messages[0].body,
+    "Please keep this shared history.",
+  );
+  assert.equal(history.body.messages[0].senderId, alice.id);
+  const conversations = await bob
+    .request("get", "/api/conversations")
+    .expect(200);
+  const sharedConversation = conversations.body.conversations.find(
+    (conversation) => conversation.id === conversationId,
+  );
+  assert.ok(sharedConversation);
+  assert.ok(
+    sharedConversation.members.some(
+      (member) => member.fullName === "Deleted user",
+    ),
+  );
+});
+
 test("following, direct/group conversations and persisted messages enforce membership", async (t) => {
   const f = await createFixture(t);
   const alice = await f.account("client", "Alice");

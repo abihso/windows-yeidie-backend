@@ -115,7 +115,7 @@ export function createApplication({ pool, config, sessionStore }) {
   app.use("/api/auth", authRoutes({ pool, io, config }));
   app.use("/api", requireAuth(pool));
   app.use("/api/users", userRoutes({ pool }));
-  app.use("/api/counsellors", counsellorRoutes({ pool }));
+  app.use("/api/counsellors", counsellorRoutes({ pool, io }));
   app.use("/api/bookings", bookingRoutes({ pool, io }));
   app.use("/api/calls", callRoutes({ pool, io, config }));
   app.use("/api", socialRoutes({ pool, io }));
