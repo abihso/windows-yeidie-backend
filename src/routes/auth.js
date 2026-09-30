@@ -36,7 +36,7 @@ async function establishSession(req, userId) {
   return csrfToken;
 }
 
-export function authRoutes({ pool, io, config }) {
+export function authRoutes({ pool, io, config, uploadStorage }) {
   const router = Router();
   const limit = rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -192,7 +192,7 @@ export function authRoutes({ pool, io, config }) {
     for (const sessionId of new Set([...deletion.sessionIds, req.sessionID])) {
       io.in(`session:${sessionId}`).disconnectSockets(true);
     }
-    await removeAvatarFile(deletion.avatarUrl);
+    await removeAvatarFile(deletion.avatarUrl, uploadStorage);
     await promisify(req.session.destroy).call(req.session);
     res.clearCookie("yiedie.sid", {
       httpOnly: true,

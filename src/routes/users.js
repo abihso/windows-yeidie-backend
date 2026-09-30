@@ -1,19 +1,10 @@
-import { randomUUID } from "node:crypto";
-import fs from "node:fs";
-import { readFile, unlink } from "node:fs/promises";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { Router } from "express";
-import multer from "multer";
 import Joi from "joi";
 import { AppError } from "../lib/errors.js";
 import { pagination, uuid, validate } from "../lib/validation.js";
 
 const columns =
   'id, full_name AS "fullName", role, bio, specialties, avatar_url AS "avatarUrl", created_at AS "createdAt"';
-const uploadDirectory = fileURLToPath(
-  new URL("../../uploads/", import.meta.url),
-);
 const imageExtensions = {
   "image/jpeg": ".jpg",
   "image/png": ".png",
@@ -21,34 +12,24 @@ const imageExtensions = {
   "image/gif": ".gif",
 };
 
-if (!fs.existsSync(uploadDirectory)) {
-  fs.mkdirSync(uploadDirectory, { recursive: true });
-}
-
-const avatarUpload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, callback) => callback(null, uploadDirectory),
-    filename: (_req, file, callback) =>
+function avatarUpload(uploadStorage) {
+  return uploadStorage.middleware({
+    limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+    fileFilter: (_req, file, callback) => {
+      if (imageExtensions[file.mimetype]) {
+        callback(null, true);
+        return;
+      }
       callback(
-        null,
-        `${Date.now()}-${randomUUID()}${imageExtensions[file.mimetype]}`,
-      ),
-  }),
-  limits: { fileSize: 5 * 1024 * 1024, files: 1 },
-  fileFilter: (_req, file, callback) => {
-    if (imageExtensions[file.mimetype]) {
-      callback(null, true);
-      return;
-    }
-    callback(
-      new AppError(
-        400,
-        "INVALID_IMAGE_TYPE",
-        "Choose a JPEG, PNG, WebP, or GIF image.",
-      ),
-    );
-  },
-});
+        new AppError(
+          400,
+          "INVALID_IMAGE_TYPE",
+          "Choose a JPEG, PNG, WebP, or GIF image.",
+        ),
+      );
+    },
+  });
+}
 
 function hasImageSignature(buffer, mimeType) {
   if (mimeType === "image/jpeg") {
@@ -71,50 +52,51 @@ function hasImageSignature(buffer, mimeType) {
   );
 }
 
-export async function removeAvatarFile(url) {
-  if (!url?.startsWith("/uploads/")) return;
-  const filename = url.slice("/uploads/".length);
-  if (!filename || path.basename(filename) !== filename) return;
-  await unlink(path.join(uploadDirectory, filename)).catch(() => {});
+export async function removeAvatarFile(url, uploadStorage) {
+  await uploadStorage.removePublicUrl(url);
 }
 
-export function userRoutes({ pool }) {
+export function userRoutes({ pool, uploadStorage }) {
   const router = Router();
-  router.post("/me/avatar", avatarUpload.single("avatar"), async (req, res) => {
-    if (!req.file) {
-      throw new AppError(400, "IMAGE_REQUIRED", "Choose an image to upload.");
-    }
-    const image = await readFile(req.file.path);
-    if (!hasImageSignature(image, req.file.mimetype)) {
-      await unlink(req.file.path).catch(() => {});
-      throw new AppError(
-        400,
-        "INVALID_IMAGE",
-        "The uploaded file is not a supported image.",
-      );
-    }
+  router.post(
+    "/me/avatar",
+    avatarUpload(uploadStorage).single("avatar"),
+    async (req, res) => {
+      if (!req.file) {
+        throw new AppError(400, "IMAGE_REQUIRED", "Choose an image to upload.");
+      }
+      const image = req.file.buffer;
+      if (!hasImageSignature(image, req.file.mimetype)) {
+        throw new AppError(
+          400,
+          "INVALID_IMAGE",
+          "The uploaded file is not a supported image.",
+        );
+      }
 
-    const avatarUrl = `/uploads/${req.file.filename}`;
-    let rows;
-    try {
-      ({ rows } = await pool.query(
-        `UPDATE users SET avatar_url = $2
+      const stored = await uploadStorage.save(req.file, "public");
+      const avatarUrl = stored.url;
+      let rows;
+      try {
+        ({ rows } = await pool.query(
+          `UPDATE users SET avatar_url = $2
          WHERE id = $1 AND deleted_at IS NULL
          RETURNING ${columns}`,
-        [req.user.id, avatarUrl],
-      ));
-    } catch (error) {
-      await unlink(req.file.path).catch(() => {});
-      throw error;
-    }
-    if (!rows[0]) {
-      await unlink(req.file.path).catch(() => {});
-      throw new AppError(404, "USER_NOT_FOUND", "User not found.");
-    }
+          [req.user.id, avatarUrl],
+        ));
+      } catch (error) {
+        await uploadStorage.remove(stored.key).catch(() => {});
+        throw error;
+      }
+      if (!rows[0]) {
+        await uploadStorage.remove(stored.key).catch(() => {});
+        throw new AppError(404, "USER_NOT_FOUND", "User not found.");
+      }
 
-    await removeAvatarFile(req.user.avatarUrl);
-    res.json({ user: rows[0] });
-  });
+      await removeAvatarFile(req.user.avatarUrl, uploadStorage);
+      res.json({ user: rows[0] });
+    },
+  );
 
   router.get("/", async (req, res) => {
     const { search, role } = validate(

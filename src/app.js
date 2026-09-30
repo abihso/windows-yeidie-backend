@@ -16,9 +16,11 @@ import { socialRoutes } from "./routes/social.js";
 import { callRoutes } from "./routes/calls.js";
 import { attachRealtime } from "./realtime/index.js";
 import { isOriginAllowed } from "./config.js";
+import { createUploadStorage } from "./services/upload-storage.js";
 
 export function createApplication({ pool, config, sessionStore }) {
   const app = express();
+  const uploadStorage = createUploadStorage(config);
   const httpServer = createServer(app);
   const PgStore = connectPgSimple(session);
   const store =
@@ -77,14 +79,16 @@ export function createApplication({ pool, config, sessionStore }) {
   app.use(cors(corsOptions));
   app.use(express.json({ limit: "25mb" }));
   app.use(express.urlencoded({ extended: true, limit: "25mb" }));
-  app.use(
-    "/uploads",
-    (req, res, next) => {
-      res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
-      next();
-    },
-    express.static(fileURLToPath(new URL("../uploads/", import.meta.url))),
-  );
+  if (!uploadStorage.usesS3) {
+    app.use(
+      "/uploads",
+      (req, res, next) => {
+        res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+        next();
+      },
+      express.static(fileURLToPath(new URL("../uploads/", import.meta.url))),
+    );
+  }
   app.get("/api/health", (req, res) =>
     res.json({ status: "ok", service: "yiedie-backend" }),
   );
@@ -112,13 +116,13 @@ export function createApplication({ pool, config, sessionStore }) {
     next();
   });
   app.use("/api", sessionMiddleware, csrfProtection);
-  app.use("/api/auth", authRoutes({ pool, io, config }));
+  app.use("/api/auth", authRoutes({ pool, io, config, uploadStorage }));
   app.use("/api", requireAuth(pool));
-  app.use("/api/users", userRoutes({ pool }));
+  app.use("/api/users", userRoutes({ pool, uploadStorage }));
   app.use("/api/counsellors", counsellorRoutes({ pool, io }));
   app.use("/api/bookings", bookingRoutes({ pool, io }));
   app.use("/api/calls", callRoutes({ pool, io, config }));
-  app.use("/api", socialRoutes({ pool, io }));
+  app.use("/api", socialRoutes({ pool, io, uploadStorage }));
   if (config.enableDemo) {
     app.use(
       "/demo",

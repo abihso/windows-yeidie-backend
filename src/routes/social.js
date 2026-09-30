@@ -1,9 +1,5 @@
 import { randomUUID } from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { Router } from "express";
-import multer from "multer";
 import Joi from "joi";
 import { transaction } from "../db/transaction.js";
 import { AppError } from "../lib/errors.js";
@@ -14,61 +10,33 @@ import {
   sendMessage,
 } from "../services/chat.js";
 
-const uploadDir = new URL("../../uploads", import.meta.url);
-const resolvedUploadDir = fileURLToPath(uploadDir);
-if (!fs.existsSync(resolvedUploadDir)) {
-  fs.mkdirSync(resolvedUploadDir, { recursive: true });
-}
-const privateUploadDir = fileURLToPath(
-  new URL("../../private-uploads/messages", import.meta.url),
-);
-if (!fs.existsSync(privateUploadDir)) {
-  fs.mkdirSync(privateUploadDir, { recursive: true });
+const imageVideoFilter = (_req, file, callback) => {
+  if (
+    file.mimetype.startsWith("image/") ||
+    file.mimetype.startsWith("video/")
+  ) {
+    callback(null, true);
+    return;
+  }
+  callback(
+    new AppError(
+      400,
+      "INVALID_FILE_TYPE",
+      "Only images and videos are allowed.",
+    ),
+  );
+};
+
+function postUpload(uploadStorage) {
+  return uploadStorage.middleware({
+    limits: { fileSize: 25 * 1024 * 1024 },
+    fileFilter: imageVideoFilter,
+  });
 }
 
-const diskStorage = multer.diskStorage({
-  destination: (_req, _file, callback) => {
-    callback(null, resolvedUploadDir);
-  },
-  filename: (_req, file, callback) => {
-    const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
-    const extension =
-      path.extname(safeName) ||
-      (file.mimetype.startsWith("video/") ? ".mp4" : ".png");
-    callback(null, `${Date.now()}-${randomUUID()}${extension}`);
-  },
-});
-const upload = multer({
-  storage: diskStorage,
-  limits: { fileSize: 25 * 1024 * 1024 },
-  fileFilter: (_req, file, callback) => {
-    if (
-      file.mimetype.startsWith("image/") ||
-      file.mimetype.startsWith("video/")
-    ) {
-      callback(null, true);
-      return;
-    }
-    callback(
-      new AppError(
-        400,
-        "INVALID_FILE_TYPE",
-        "Only images and videos are allowed.",
-      ),
-    );
-  },
-});
-const messageUpload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, callback) => callback(null, privateUploadDir),
-    filename: (_req, file, callback) => {
-      const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
-      const extension = path.extname(safeName) || ".bin";
-      callback(null, `${Date.now()}-${randomUUID()}${extension}`);
-    },
-  }),
-  limits: { fileSize: 25 * 1024 * 1024 },
-});
+function messageUpload(uploadStorage) {
+  return uploadStorage.middleware({ limits: { fileSize: 25 * 1024 * 1024 } });
+}
 
 const conversationSchema = Joi.object({
   kind: Joi.string().valid("direct", "group").required(),
@@ -197,7 +165,7 @@ function requireGroupOwner(conversation, userId) {
   }
 }
 
-export function socialRoutes({ pool, io }) {
+export function socialRoutes({ pool, io, uploadStorage }) {
   const router = Router();
 
   router.post("/users/:id/follow", async (req, res) => {
@@ -462,47 +430,61 @@ export function socialRoutes({ pool, io }) {
     });
   });
 
-  router.post("/posts", upload.single("media"), async (req, res) => {
-    const payload = req.body ?? {};
-    const mediaType = req.file
-      ? req.file.mimetype.startsWith("video/")
-        ? "video"
-        : "image"
-      : (payload.mediaType ?? null);
-    const mediaUrl = req.file
-      ? `/uploads/${req.file.filename}`
-      : (payload.mediaUrl ?? "");
-    const input = validate(postSchema, {
-      body: payload.body ?? "",
-      mediaType,
-      mediaUrl,
-    });
+  router.post(
+    "/posts",
+    postUpload(uploadStorage).single("media"),
+    async (req, res) => {
+      console.log("hit")
+      const payload = req.body ?? {};
+      const mediaType = req.file
+        ? req.file.mimetype.startsWith("video/")
+          ? "video"
+          : "image"
+        : (payload.mediaType ?? null);
+      const mediaUrl = req.file ? "upload-pending" : (payload.mediaUrl ?? "");
+      const input = validate(postSchema, {
+        body: payload.body ?? "",
+        mediaType,
+        mediaUrl,
+      });
 
-    const result = await pool.query(
-      `INSERT INTO posts (id, author_id, body, media_type, media_url)
+      const stored = req.file
+        ? await uploadStorage.save(req.file, "public")
+        : null;
+      if (stored) input.mediaUrl = stored.url;
+      let result;
+      try {
+        result = await pool.query(
+          `INSERT INTO posts (id, author_id, body, media_type, media_url)
          VALUES ($1, $2, $3, $4, $5)
          RETURNING id, body, media_type AS "mediaType", media_url AS "mediaUrl", created_at AS "createdAt"`,
-      [
-        randomUUID(),
-        req.user.id,
-        input.body ?? "",
-        input.mediaType ?? null,
-        input.mediaUrl || null,
-      ],
-    );
-    const post = result.rows[0];
-    res.status(201).json({
-      post: {
-        ...post,
-        author: {
-          id: req.user.id,
-          fullName: req.user.fullName,
-          role: req.user.role,
-          avatarUrl: req.user.avatarUrl,
+          [
+            randomUUID(),
+            req.user.id,
+            input.body ?? "",
+            input.mediaType ?? null,
+            input.mediaUrl || null,
+          ],
+        );
+      } catch (error) {
+        // console.error("Error creating post:", error);
+        if (stored) await uploadStorage.remove(stored.key).catch(() => {});
+        throw error;
+      }
+      const post = result.rows[0];
+      res.status(201).json({
+        post: {
+          ...post,
+          author: {
+            id: req.user.id,
+            fullName: req.user.fullName,
+            role: req.user.role,
+            avatarUrl: req.user.avatarUrl,
+          },
         },
-      },
-    });
-  });
+      });
+    },
+  );
 
   router.post("/conversations", async (req, res) => {
     const input = validate(conversationSchema, req.body);
@@ -770,29 +752,34 @@ export function socialRoutes({ pool, io }) {
         next(error);
       }
     },
-    messageUpload.single("file"),
+    messageUpload(uploadStorage).single("file"),
     async (req, res) => {
+      let stored;
+      let message;
       try {
         const body = (req.body?.body ?? "").trim();
         if (body) validate(messageBodySchema, { body });
         if (!body && !req.file) {
           throw new AppError(400, "MESSAGE_REQUIRED", "Add a message or file.");
         }
-        const message = await sendMessage(pool, {
+        stored = req.file
+          ? await uploadStorage.save(req.file, "private")
+          : null;
+        message = await sendMessage(pool, {
           conversationId: req.params.id,
           senderId: req.user.id,
           body,
           attachmentName: req.file?.originalname.slice(0, 255) ?? null,
-          attachmentUrl: req.file?.filename ?? null,
+          attachmentUrl: stored?.key ?? null,
           attachmentMime: req.file?.mimetype ?? null,
           attachmentSize: req.file?.size ?? null,
         });
-        await deliverMessage(io, pool, message);
-        res.status(201).json({ message });
       } catch (error) {
-        if (req.file) await fs.promises.unlink(req.file.path).catch(() => {});
+        if (stored) await uploadStorage.remove(stored.key).catch(() => {});
         throw error;
       }
+      await deliverMessage(io, pool, message);
+      res.status(201).json({ message });
     },
   );
 
@@ -813,19 +800,18 @@ export function socialRoutes({ pool, io }) {
       if (!attachment?.attachmentUrl) {
         throw new AppError(404, "ATTACHMENT_NOT_FOUND", "File not found.");
       }
-      const filename = path.basename(attachment.attachmentUrl);
-      if (filename !== attachment.attachmentUrl) {
+      const sent = await uploadStorage.sendPrivate(
+        attachment.attachmentUrl,
+        res,
+        {
+          inline: req.query.inline === "true",
+          name: attachment.attachmentName || "attachment",
+          mime: attachment.attachmentMime,
+        },
+      );
+      if (!sent) {
         throw new AppError(404, "ATTACHMENT_NOT_FOUND", "File not found.");
       }
-      if (req.query.inline === "true") {
-        res.type(attachment.attachmentMime || "application/octet-stream");
-        res.set("Content-Disposition", "inline; filename=attachment");
-        res.sendFile(filename, { root: privateUploadDir });
-        return;
-      }
-      res.download(filename, attachment.attachmentName || "attachment", {
-        root: privateUploadDir,
-      });
     },
   );
 

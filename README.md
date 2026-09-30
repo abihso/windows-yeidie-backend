@@ -28,6 +28,24 @@ On Render, `TRUST_PROXY` defaults to `1` so secure cookies work behind its HTTPS
 proxy. An explicit value such as `TRUST_PROXY=0` overrides that default.
 `COOKIE_SAME_SITE=none` requires `NODE_ENV=production` and HTTPS.
 
+### S3 uploads
+
+The backend uses S3 for avatar images, community post media, and private chat
+attachments when `AWS_BUCKET_NAME` is set. Configure `AWS_REGION` and provide
+AWS credentials through the runtime's IAM role or the existing
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` environment variables. Do not
+commit credentials.
+
+Set `AWS_PUBLIC_BASE_URL` to the root URL of your CloudFront distribution or
+other public asset domain when using one. Without it, public media URLs use the
+regional S3 bucket URL, so the bucket must allow reads under the `uploads/`
+prefix. Grant the backend identity `s3:PutObject`, `s3:GetObject`, and
+`s3:DeleteObject` for the bucket objects. Chat attachments are stored under
+`messages/` and are only downloaded through the authenticated API; do not make
+that prefix publicly readable. The backend does not set object ACLs.
+
+Without `AWS_BUCKET_NAME`, the backend continues storing uploads on local disk.
+
 In the Vercel frontend project's environment settings, set:
 
 ```dotenv

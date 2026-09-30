@@ -65,6 +65,9 @@ export function readConfig(env = process.env) {
     TURN_URLS: Joi.string().allow("").default(""),
     TURN_SECRET: Joi.string().allow("").default(""),
     ENABLE_DEMO: Joi.boolean().default(false),
+    AWS_BUCKET_NAME: Joi.string().trim().allow("").default(""),
+    AWS_REGION: Joi.string().trim().allow("").default(""),
+    AWS_PUBLIC_BASE_URL: Joi.string().trim().allow("").default(""),
   })
     .unknown(true)
     .validate(env);
@@ -102,6 +105,9 @@ export function readConfig(env = process.env) {
       "COOKIE_SAME_SITE=none requires production HTTPS (secure cookies).",
     );
   }
+  if (value.AWS_BUCKET_NAME && !value.AWS_REGION) {
+    throw new Error("AWS_REGION is required when AWS_BUCKET_NAME is set.");
+  }
   const turnUrls = value.TURN_URLS.split(",")
     .map((s) => s.trim())
     .filter(Boolean);
@@ -130,6 +136,9 @@ export function readConfig(env = process.env) {
       .filter(Boolean),
     turnUrls,
     turnSecret: value.TURN_SECRET,
+    s3Bucket: value.AWS_BUCKET_NAME,
+    s3Region: value.AWS_REGION,
+    s3PublicBaseUrl: value.AWS_PUBLIC_BASE_URL,
     callInvitationTimeoutMs: 10 * 60 * 1000,
     maxCallParticipants: 6,
     enableDemo: value.ENABLE_DEMO,
